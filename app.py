@@ -1,18 +1,19 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-DB_PATH = 'videos.db'
+# Obtener URL de la base de datos desde variable de entorno
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 def get_db():
-    """Obtener conexión a la base de datos"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """Obtener conexión a PostgreSQL"""
+    conn = psycopg2.connect(DATABASE_URL)
     return conn
 
 @app.route('/', methods=['GET'])
@@ -21,7 +22,8 @@ def home():
     return jsonify({
         'status': 'online',
         'service': 'YouTube Seguro API',
-        'version': '1.0'
+        'version': '1.0',
+        'database': 'PostgreSQL'
     })
 
 @app.route('/videos', methods=['GET'])
@@ -29,15 +31,18 @@ def get_videos():
     """Obtener todos los videos"""
     try:
         conn = get_db()
-        videos = conn.execute('''
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
             SELECT * FROM videos 
             ORDER BY orden DESC, fecha_agregado DESC
-        ''').fetchall()
+        ''')
+        videos = cursor.fetchall()
+        cursor.close()
         conn.close()
         
         return jsonify({
             'status': 'success',
-            'videos': [dict(v) for v in videos]
+            'videos': videos
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -47,16 +52,16 @@ def get_video(video_id):
     """Obtener un video específico"""
     try:
         conn = get_db()
-        video = conn.execute(
-            'SELECT * FROM videos WHERE id = ?', 
-            (video_id,)
-        ).fetchone()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM videos WHERE id = %s', (video_id,))
+        video = cursor.fetchone()
+        cursor.close()
         conn.close()
         
         if video:
             return jsonify({
                 'status': 'success',
-                'video': dict(video)
+                'video': video
             })
         return jsonify({'status': 'error', 'message': 'Video no encontrado'}), 404
     except Exception as e:
@@ -67,17 +72,20 @@ def get_videos_by_category(categoria):
     """Obtener videos por categoría"""
     try:
         conn = get_db()
-        videos = conn.execute('''
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
             SELECT * FROM videos 
-            WHERE LOWER(categoria) = LOWER(?)
+            WHERE LOWER(categoria) = LOWER(%s)
             ORDER BY vistas DESC, fecha_agregado DESC
-        ''', (categoria,)).fetchall()
+        ''', (categoria,))
+        videos = cursor.fetchall()
+        cursor.close()
         conn.close()
         
         return jsonify({
             'status': 'success',
             'categoria': categoria,
-            'videos': [dict(v) for v in videos]
+            'videos': videos
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -92,18 +100,21 @@ def search_videos():
     
     try:
         conn = get_db()
-        videos = conn.execute('''
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
             SELECT * FROM videos 
-            WHERE titulo LIKE ? OR descripcion LIKE ? OR canal LIKE ?
+            WHERE titulo ILIKE %s OR descripcion ILIKE %s OR canal ILIKE %s
             ORDER BY vistas DESC
-        ''', (f'%{query}%', f'%{query}%', f'%{query}%')).fetchall()
+        ''', (f'%{query}%', f'%{query}%', f'%{query}%'))
+        videos = cursor.fetchall()
+        cursor.close()
         conn.close()
         
         return jsonify({
             'status': 'success',
             'query': query,
             'resultados': len(videos),
-            'videos': [dict(v) for v in videos]
+            'videos': videos
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -113,20 +124,25 @@ def register_view(video_id):
     """Registrar una vista de video"""
     try:
         conn = get_db()
+        cursor = conn.cursor()
         
         # Verificar que el video existe
-        video = conn.execute('SELECT id FROM videos WHERE id = ?', (video_id,)).fetchone()
+        cursor.execute('SELECT id FROM videos WHERE id = %s', (video_id,))
+        video = cursor.fetchone()
+        
         if not video:
+            cursor.close()
             conn.close()
             return jsonify({'status': 'error', 'message': 'Video no encontrado'}), 404
         
         # Incrementar vistas
-        conn.execute('UPDATE videos SET vistas = vistas + 1 WHERE id = ?', (video_id,))
+        cursor.execute('UPDATE videos SET vistas = vistas + 1 WHERE id = %s', (video_id,))
         
         # Registrar en historial
-        conn.execute('INSERT INTO historial (video_id) VALUES (?)', (video_id,))
+        cursor.execute('INSERT INTO historial (video_id) VALUES (%s)', (video_id,))
         
         conn.commit()
+        cursor.close()
         conn.close()
         
         return jsonify({'status': 'success', 'message': 'Vista registrada'})
@@ -138,38 +154,42 @@ def get_stats():
     """Obtener estadísticas generales"""
     try:
         conn = get_db()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        total_videos = conn.execute('SELECT COUNT(*) as count FROM videos').fetchone()['count']
-        total_vistas = conn.execute('SELECT SUM(vistas) as total FROM videos').fetchone()['total']
-        mas_visto = conn.execute('''
-            SELECT titulo, vistas, canal FROM videos 
-            ORDER BY vistas DESC LIMIT 1
-        ''').fetchone()
+        cursor.execute('SELECT COUNT(*) as count FROM videos')
+        total_videos = cursor.fetchone()['count']
         
-        # Vistas por categoría
-        vistas_categoria = conn.execute('''
-            SELECT categoria, COUNT(*) as videos, SUM(vistas) as vistas
+        cursor.execute('SELECT COALESCE(SUM(vistas), 0) as total FROM videos')
+        total_vistas = cursor.fetchone()['total']
+        
+        cursor.execute('SELECT titulo, vistas, canal FROM videos ORDER BY vistas DESC LIMIT 1')
+        mas_visto = cursor.fetchone()
+        
+        cursor.execute('''
+            SELECT categoria, COUNT(*) as videos, COALESCE(SUM(vistas), 0) as vistas
             FROM videos
             GROUP BY categoria
-        ''').fetchall()
+        ''')
+        vistas_categoria = cursor.fetchall()
         
         # Videos vistos hoy
-        hoy = datetime.now().strftime('%Y-%m-%d')
-        vistas_hoy = conn.execute('''
+        cursor.execute('''
             SELECT COUNT(*) as count FROM historial
-            WHERE DATE(fecha) = ?
-        ''', (hoy,)).fetchone()['count']
+            WHERE DATE(fecha) = CURRENT_DATE
+        ''')
+        vistas_hoy = cursor.fetchone()['count']
         
+        cursor.close()
         conn.close()
         
         return jsonify({
             'status': 'success',
             'stats': {
                 'total_videos': total_videos,
-                'total_vistas': total_vistas or 0,
+                'total_vistas': total_vistas,
                 'vistas_hoy': vistas_hoy,
-                'video_mas_visto': dict(mas_visto) if mas_visto else None,
-                'por_categoria': [dict(c) for c in vistas_categoria]
+                'video_mas_visto': mas_visto,
+                'por_categoria': vistas_categoria
             }
         })
     except Exception as e:
@@ -180,12 +200,15 @@ def get_categorias():
     """Obtener todas las categorías"""
     try:
         conn = get_db()
-        categorias = conn.execute('SELECT * FROM categorias ORDER BY nombre').fetchall()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('SELECT * FROM categorias ORDER BY nombre')
+        categorias = cursor.fetchall()
+        cursor.close()
         conn.close()
         
         return jsonify({
             'status': 'success',
-            'categorias': [dict(c) for c in categorias]
+            'categorias': categorias
         })
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -204,14 +227,14 @@ def add_video():
     
     try:
         conn = get_db()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         # Verificar si el video ya existe
-        exists = conn.execute(
-            'SELECT id FROM videos WHERE youtube_id = ?', 
-            (data['youtube_id'],)
-        ).fetchone()
+        cursor.execute('SELECT id FROM videos WHERE youtube_id = %s', (data['youtube_id'],))
+        exists = cursor.fetchone()
         
         if exists:
+            cursor.close()
             conn.close()
             return jsonify({
                 'status': 'error', 
@@ -219,9 +242,10 @@ def add_video():
             }), 409
         
         # Insertar video
-        cursor = conn.execute('''
+        cursor.execute('''
             INSERT INTO videos (youtube_id, titulo, canal, thumbnail, duracion, descripcion, categoria)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
         ''', (
             data['youtube_id'],
             data['titulo'],
@@ -232,8 +256,9 @@ def add_video():
             data['categoria']
         ))
         
+        video_id = cursor.fetchone()['id']
         conn.commit()
-        video_id = cursor.lastrowid
+        cursor.close()
         conn.close()
         
         return jsonify({
@@ -249,8 +274,10 @@ def delete_video(video_id):
     """Eliminar un video (admin)"""
     try:
         conn = get_db()
-        conn.execute('DELETE FROM videos WHERE id = ?', (video_id,))
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM videos WHERE id = %s', (video_id,))
         conn.commit()
+        cursor.close()
         conn.close()
         
         return jsonify({
