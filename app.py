@@ -34,7 +34,7 @@ def get_videos():
             with conn.cursor() as cursor:
                 cursor.execute('''
                     SELECT * FROM videos 
-                    ORDER BY orden DESC, fecha_agregado DESC
+                    ORDER BY BY random()
                 ''')
                 columns = [desc[0] for desc in cursor.description]
                 videos = [dict(zip(columns, row)) for row in cursor.fetchall()]
